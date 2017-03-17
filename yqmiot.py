@@ -7,6 +7,21 @@ import json
 
 from paho.mqtt.client import Client as Mqtt
 
+VERSION = "0.0.1"
+
+"""
+    每个设备都拥有三类特性：属性，事件，方法。
+    属性表示设备的当前状态，比如：电力状态，照明开关等。每当属性发生改变就会立即上报。
+    事件表示设备当前发生了什么，按下按钮，电力不足警告等。
+    方法则是设备对外提供的操作接口，通过它可以对设备进行控制。比如：重启，打开照明，关机等。
+"""
+
+# 动作
+YQMIOT_ACTION_PROPERTY = "property" # 属性
+YQMIOT_ACTION_EVENT = "event" # 事件
+YQMIOT_ACTION_CALL = "call" # 方法调用
+YQMIOT_ACTION_ACK = "ack" # 方法响应
+
 # 系统事件
 YQMIOT_EVENT_ONLINE = "yqmiot.event.online" # 上线通知
 YQMIOT_EVENT_OFFLINE = "yqmiot.event.offline" # 下线通知
@@ -18,35 +33,31 @@ YQMIOT_PROPERTY_ACCOUNTID = "yqmiot.property.accountid" # 节点所在账号id�
 YQMIOT_PROPERTY_MODEL = "yqmiot.property.model" # 设备所属类型
 YQMIOT_PROPERTY_VERSION = "yqmiot.property.version" # 设备所属固件版本号
 
-# 系统方法(动作？)
-YQMIOT_METHOD_PING = "yqmiot.event.ping" # ping连通测试
-YQMIOT_METHOD_PING_ACK = "yqmiot.event.ping.ack" # 对ping的回应
-
-VERSION = "0.0.1"
+# 系统方法
+YQMIOT_METHOD_PING = "yqmiot.method.ping" # ping连通测试
+YQMIOT_METHOD_TEST = "yqmiot.method.test" # 方法调用测试
 
 logging.basicConfig(level=logging.DEBUG,
     format = '[%(asctime)s] %(levelname)s %(message)s',
     datefmt = '%Y-%m-%d %H:%M:%S')
-
 root = logging.getLogger()
 root.setLevel(logging.NOTSET)
 
 class Action(object):
     def __init__(self, receiver, sender, actionName, payload=None):
         if payload:
-            self.decode(payload)
+            self.__dict__.update(json.loads(payload))
         self.receiver = receiver
         self.sender = sender
         self.action = actionName
 
-    def load(self, payload):
-        self.__dict__.update(json.loads(payload))
-
     def dump(self):
         return json.dumps(self.__dict__)
 
-    def buildReply(self, actionName, payload=None):
-        return Action(self.sender, self.receiver, actionName, payload)
+    def reply(self, payload=None):
+        if self.action != YQMIOT_ACTION_CALL:
+            raise ValueError("only YQMIOT_ACTION_CALL support reply.")
+        return Action(self.sender, self.receiver, YQMIOT_ACTION_ACK, payload)
 
 class MqttClient(object):
     """Mqtt通讯封装"""
@@ -54,7 +65,12 @@ class MqttClient(object):
         logging.info("MqttClient.__init__() address=({address[0]}, {address[1]})".format(address=address))
         self.client = Mqtt()
         self.address = address
-        assert isinstance(address, tuple), "the address is invalid."
+
+        if not isinstance(address, tuple) or len(address) != 2:
+            raise ValueError("Invalid address.")
+
+        self.client.on_connect = lambda client, userdata, flags, rc: self.handleConnected()
+        self.client.on_message = lambda client, userdata, msg: self.handleMessage(msg.topic, msg.payload)
 
     def handleConnected(self):
         logging.info("MqttClient.handleConnected()")
@@ -70,19 +86,12 @@ class MqttClient(object):
     def handleMessage(self, topic, payload):
         logging.info("MqttClient.handleMessage() topic={}".format(topic))
 
-    def run(self):
-        logging.info("MqttClient.run()")
+    def start(self):
+        self.client.connect_async(self.address[0], self.address[1])
+        self.client.loop_start()
 
-        def on_connect(client, userdata, flags, rc):
-            self.handleConnected()
-
-        def on_message(client, userdata, msg):
-            self.handleMessage(msg.topic, msg.payload)
-
-        self.client.on_connect = on_connect
-        self.client.on_message = on_message
-        self.client.connect(self.address[0], self.address[1])
-        self.client.loop_forever()
+    def stop(self):
+        self.client.loop_stop()
 
 
 class YqmiotBase(MqttClient):
@@ -95,11 +104,12 @@ class YqmiotBase(MqttClient):
         logging.info("YqmiotBase.__init__() address=({}, {}), accountid={}, nodeid={}".format(address[0], address[1], accountid, nodeid))
         super(YqmiotBase, self).__init__(address)
         self.accountid = accountid
-        assert self.accountid > 0, "accountid invalid"
         self.nodeid = nodeid
-        assert self.nodeid > 0, "nodeid invalid"
         self.authkey = None # TODO
         self.handlers = {}
+
+        if self.accountid <= 0 or self.nodeid <= 0:
+            raise ValueError("Invalid parameter")
 
     def sendAction(self, action):
         logging.info("YqmiotBase.sendAction()")
@@ -113,7 +123,12 @@ class YqmiotBase(MqttClient):
         if action:
             handler = self.handlers.get(action.action)
             if handler:
-                handler(self, action)
+                try:
+                    action = handler(self, action)
+                    if isinstance(action, Action):
+                        self.sendAction(action) # 再来一发
+                except:
+                    logging.warn("an error occurred while handleAction")
 
     def handleConnected(self):
         logging.info("YqmiotBase.handleConnected()")
@@ -170,37 +185,30 @@ class YqmiotClient(YqmiotBase):
         logging.info("YqmiotClient.handleConnected()")
         super(YqmiotClient, self).handleConnected()
 
-        # 推送上线广播
-        actionOnline = Action.buildAction(0, 0, "broadcast")
-        actionOnline.message = (u"啦啦啦，我是{}号节点，我上线啦！".format(self.nodeid))
-        self.sendAction(actionOnline)
-
-        # 订阅广播消息
-        topic = "yqmiot/{self.accountid}/0/#".format(self=self)
-        self.subscribe(topic)
+        # 上线通知
+        self.reportEvent(YQMIOT_EVENT_ONLINE)
 
     def reportProperty(self, properties):
         """
         属性上报
             properties(dict) 设备属性集
         """
-
         if not isinstance(properties, dict):
-            raise ValueError
+            raise ValueError("properties must be dict.")
 
         # 属性发生变化或大于最小间隔才回上报
         if self.properties == properties and ((time.time() - self.reportLast) < self.reportInterval)
             return
-        self.properties = properties
+        self.properties = copy.deepcopy(properties)
         self.reportLast = time.time()
         
         try:
-            action = Action(0, None, "property", properties)
+            action = Action(0, None, YQMIOT_ACTION_PROPERTY, properties)
             self.sendAction(action)
         except:
             logging.warn("reportProperty error")
 
-    def reportEvent(self, name, data):
+    def reportEvent(self, name, data = None):
         """
         事件上报
             name 事件名
@@ -248,6 +256,16 @@ class YqmiotController(YqmiotClient):
     """
     月球猫互联控制器
     """
+    # 订阅广播消息
+        topic = "yqmiot/{self.accountid}/0/#".format(self=self)
+        self.subscribe(topic)
+
+class YqmiotRaspberryPi(YqmiotClient):
+    """
+    树莓派
+    """
+
+
 
 def main(argv=None):
     try:
