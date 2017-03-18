@@ -16,11 +16,13 @@ VERSION = "0.0.1"
     方法则是设备对外提供的操作接口，通过它可以对设备进行控制。比如：重启，打开照明，关机等。
 """
 
-# 动作
-YQMIOT_ACTION_PROPERTY = "property" # 属性
-YQMIOT_ACTION_EVENT = "event" # 事件
-YQMIOT_ACTION_CALL = "call" # 方法调用
-YQMIOT_ACTION_ACK = "ack" # 方法响应
+YQMIOT_BROADCAST_RECEIVER = 0 # 广播接受者id
+
+# 系统命令
+YQMIOT_COMMAND_PROPERTY = "property" # 属性上报
+YQMIOT_COMMAND_EVENT = "event" # 事件上报
+YQMIOT_COMMAND_CALL = "call" # 方法调用
+YQMIOT_COMMAND_ACK = "ack" # 方法响应
 
 # 系统事件
 YQMIOT_EVENT_ONLINE = "yqmiot.event.online" # 上线通知
@@ -41,50 +43,60 @@ logging.basicConfig(level=logging.DEBUG,
     format = '[%(asctime)s] %(levelname)s %(message)s',
     datefmt = '%Y-%m-%d %H:%M:%S')
 root = logging.getLogger()
-root.setLevel(logging.NOTSET)
+root.setLevel(logging.WARN)
 
-class Action(object):
-    def __init__(self, receiver, sender, actionName, payload=None):
+class Command(object):
+    """Mqtt Command"""
+    def __init__(self, name, receiver=None, sender=None, payload=None):
         if payload:
-            self.__dict__.update(json.loads(payload))
-        self.receiver = receiver
-        self.sender = sender
-        self.action = actionName
+            self.__dict__.update(payload)
+        self.name = name # Command 名称 
+        self.receiver = receiver # 接受者
+        self.sender = sender # 发送者
+        # self.seq 包追踪序列
+        # self.action 方法调用的方法名，事件上报的事件名
+        # self.callid 方法调用id，发送方根据id识别应答包
+        # self.[other params] 其他属性
 
-    def dump(self):
+    def tojson(self):
         return json.dumps(self.__dict__)
 
     def reply(self, payload=None):
-        if self.action != YQMIOT_ACTION_CALL:
-            raise ValueError("only YQMIOT_ACTION_CALL support reply.")
-        return Action(self.sender, self.receiver, YQMIOT_ACTION_ACK, payload)
+        if self.name == YQMIOT_COMMAND_CALL:
+            payload = payload if isinstance(payload, dict) else {}
+            payload["callseq"] = getattr(self, "callseq")
+            return Command(YQMIOT_COMMAND_ACK, self.sender, payload=payload)
+        else:
+            raise ValueError("only YQMIOT_COMMAND_CALL support reply.")
 
 class MqttClient(object):
     """Mqtt通讯封装"""
     def __init__(self, address):
-        logging.info("MqttClient.__init__() address=({address[0]}, {address[1]})".format(address=address))
-        self.client = Mqtt()
-        self.address = address
-
         if not isinstance(address, tuple) or len(address) != 2:
             raise ValueError("Invalid address.")
 
-        self.client.on_connect = lambda client, userdata, flags, rc: self.handleConnected()
-        self.client.on_message = lambda client, userdata, msg: self.handleMessage(msg.topic, msg.payload)
+        def on_connect(client, userdata, flags, rc):
+            self.handleConnected()
+
+        def on_message(client, userdata, msg):
+            self.handleMessage(msg.topic, msg.payload)
+
+        self.client = Mqtt()
+        self.address = address
+        self.client.on_connect = on_connect
+        self.client.on_message = on_message
 
     def handleConnected(self):
-        logging.info("MqttClient.handleConnected()")
+        pass
+
+    def handleMessage(self, topic, payload):
+        pass
 
     def publish(self, topic, payload=None, qos=0, retain=False):
-        logging.info("MqttClient.publish() topic={}".format(topic))
         self.client.publish(topic, payload, qos, retain)
 
     def subscribe(self, topic, qos=0):
-        logging.info("MqttClient.subscribe() topic={}".format(topic))
         self.client.subscribe(topic, qos)
-
-    def handleMessage(self, topic, payload):
-        logging.info("MqttClient.handleMessage() topic={}".format(topic))
 
     def start(self):
         self.client.connect_async(self.address[0], self.address[1])
@@ -95,13 +107,10 @@ class MqttClient(object):
 
 
 class YqmiotBase(MqttClient):
-    """
-        月球猫互联
+    """月球猫互联
         accountid 账号id
-        nodeid 设备id
-    """
+        nodeid 设备id"""
     def __init__(self, address, accountid, nodeid):
-        logging.info("YqmiotBase.__init__() address=({}, {}), accountid={}, nodeid={}".format(address[0], address[1], accountid, nodeid))
         super(YqmiotBase, self).__init__(address)
         self.accountid = accountid
         self.nodeid = nodeid
@@ -109,208 +118,178 @@ class YqmiotBase(MqttClient):
         self.handlers = {}
 
         if self.accountid <= 0 or self.nodeid <= 0:
-            raise ValueError("Invalid parameter")
-
-    def sendAction(self, action):
-        logging.info("YqmiotBase.sendAction()")
-        if action:
-            topic = "yqmiot/{self.accountid}/{action.receiver}/{self.nodeid}/{action.action}".format(self=self, action=action)
-            payload = action.encode()
-            self.sendMessage(topic, payload)
-
-    def handleAction(self, action):
-        logging.info("YqmiotBase.handleAction()")
-        if action:
-            handler = self.handlers.get(action.action)
-            if handler:
-                try:
-                    action = handler(self, action)
-                    if isinstance(action, Action):
-                        self.sendAction(action) # 再来一发
-                except:
-                    logging.warn("an error occurred while handleAction")
-
-    def handleConnected(self):
-        logging.info("YqmiotBase.handleConnected()")
-        super(YqmiotBase, self).handleConnected()
-        topic = "yqmiot/{self.accountid}/{self.nodeid}/#".format(self=self)
-        self.subscribe(topic)
+            raise ValueError("Invalid accountid or nodeid.")
 
     def handleMessage(self, topic, payload):
-        logging.info("YqmiotBase.handleMessage() topic={}".format(topic))
         super(YqmiotBase, self).handleMessage(topic, payload)
 
         try:
-            prefix, account, receiver, sender, actionName = topic.split("/")
-            # TODO 检查是否是发送给自己的Action
-        except ValueError:
-            logging.info("the topic is invalid. {}".format(topic))
-            return
-
-        try:
-            action = Action(receiver, sender, actionName, payload)
+            prefix, account, receiver, sender, command = topic.split("/")
+            if prefix == "yqmiot" \
+                and account == self.accountid \
+                and receiver == self.nodeid:
+                try:
+                    cmd = Command(command, receiver, sender, payload)
+                    try:
+                        self.handleCommand(cmd)
+                    except:
+                        logging.error("Failed to handle command. {}".format(topic))
+                except:
+                    logging.error("Unpack failure. {}".format(topic))
+            else:
+                logging.error("Invalid topic. {}".format(topic))
         except:
-            logging.info("the payload is invalid. {}".format(topic))
+            logging.error("Invalid topic. {}".format(topic))
 
-        try:
-            self.handleAction(action)
-        except:
-            logging.info("handleAction erorr. {}".format(topic))
+    def handleConnected(self):
+        super(YqmiotBase, self).handleConnected()
+        # 侦听发送给自己的消息
+        topic = "yqmiot/{self.accountid}/{self.nodeid}/#".format(self=self)
+        self.subscribe(topic)
 
-    def route(self, actionName):
-        logging.info("YqmiotBase.route() actionName=%s" % actionName)
+    def handleCommand(self, cmd):
+        if cmd:
+            handler = self.handlers.get(cmd.name)
+            if handler:
+                try:
+                    cmd = handler(self, cmd)
+                    if isinstance(cmd, Command):
+                        self.sendCommand(cmd) # 再来一发
+                except:
+                    logging.error("Error in processing handler.")
+            else:
+                logging.warn("Could not find handler.")
+        else:
+            logging.error("Invalid cmd.")
+    
+    def sendCommand(self, cmd):
+        if cmd:
+            try:
+                accountid = self.accountid
+                receiver = getattr(cmd, "receiver", YQMIOT_BROADCAST_RECEIVER)
+                receiver = YQMIOT_BROADCAST_RECEIVER if receiver == None else receiver
+                sender = self.nodeid
+                name = cmd.name
+                topic = "yqmiot/{}/{}/{}/{}".format(accountid, receiver, sender, name)
+                cmd.receiver = receiver
+                cmd.sender = sender
+                payload = cmd.tojson()
+                self.publish(topic, payload)
+            except:
+                logging.error("Error sending command.")
+        else:
+            logging.error("Invalid cmd.")
+
+    def addHandler(self, name, handler):
+        if not self.handlers.has_key(name):
+            self.handlers[name] = handler
+        else:
+            logging.warn("The corresponding processor already exists.")
+
+    def route(self, name):
         def decorator(func):
-            self.handlers[actionName] = func
+            self.addHandler(name, func)
             return func
         return decorator
 
 class YqmiotClient(YqmiotBase):
-    """
-    月球猫互联客户端
+    """月球猫互联客户端
 
     属性定时上报
     属性变更上报
     事件上报
-    处理方法调用，并回包
-
-    """
+    处理方法调用，并回包"""
     def __init__(self, address, accountid, nodeid):
         super(YqmiotClient, self).__init__(address, accountid, nodeid)
-        self.reportInterval = 10 # 属性上报间隔
-        self.reportLast = None # 上次上报的时间
-        self.properties = {} # 缓存的属性
-        self.callseq = 0 # 调用序号
+        self.callseq = 0
+        self.addHandler(YQMIOT_COMMAND_CALL, self.handleRemoteCall)
 
     def handleConnected(self):
-        logging.info("YqmiotClient.handleConnected()")
         super(YqmiotClient, self).handleConnected()
-
+        logging.info("Connect server successfully.")
         # 上线通知
         self.reportEvent(YQMIOT_EVENT_ONLINE)
 
+        # TODO 推送下线遗言
+
+    def handleCommand(self, cmd):
+        if 
+        super(YqmiotClient, self).handleCommand(cmd)
+
     def reportProperty(self, properties):
-        """
-        属性上报
-            properties(dict) 设备属性集
-        """
-        if not isinstance(properties, dict):
-            raise ValueError("properties must be dict.")
+        """属性上报
+            properties(dict) 设备属性集"""
+        if isinstance(properties, dict):
+            try:
+                cmd = Command(YQMIOT_COMMAND_PROPERTY, payload=properties)
+                self.sendCommand(cmd)
+            except:
+                logging.error("An error occurred while reporting the property.")
+        else:
+            raise TypeError("Incorrect properties type.")
 
-        # 属性发生变化或大于最小间隔才回上报
-        if self.properties == properties and ((time.time() - self.reportLast) < self.reportInterval)
-            return
-        self.properties = copy.deepcopy(properties)
-        self.reportLast = time.time()
+    def reportEvent(self, action, params = None):
+        """事件上报
+            action 事件名
+            params 参数"""
+        try:
+            cmd = Command(YQMIOT_COMMAND_EVENT)
+            cmd.action = action
+            if isinstance(params, dict):
+                cmd.__dict__.update(params)
+            self.sendCommand(cmd)
+        except:
+            logging.error("An error occurred while reporting the event.")
+
+    def callRemote(self, receiver, action, params = None):
+        if receiver and receiver != YQMIOT_BROADCAST_RECEIVER and action:
+            try:
+                cmd = Command(YQMIOT_COMMAND_CALL, receiver, payload=params)
+                cmd.callseq = self.callseq = (self.callseq + 1)
+                self.sendCommand(cmd)
+            except:
+                logging.error("Error calling remote action.")
+        else:
+            logging.error("Remote action parameter is incorrect.")
         
-        try:
-            action = Action(0, None, YQMIOT_ACTION_PROPERTY, properties)
-            self.sendAction(action)
-        except:
-            logging.warn("reportProperty error")
-
-    def reportEvent(self, name, data = None):
-        """
-        事件上报
-            name 事件名
-            data 参数
-        """
-        try:
-            payload = {}
-            payload.name = name
-            payload.data = data
-            action = Action(0, None, "event", payload)
-            self.sendAction(action)
-        except:
-            logging.warn("reportEvent error")
-
-    def callNode(self, nodeid, method, data = None):
-        if not nodeid or nodeid == 0:
-            logging.warn("callNode params invalid")
-            return 
-
-        payload = {}
-        payload.seq = self.callseq = (self.callseq + 1)
-        payload.method = method
-        payload.data = data
+    def handleRemoteCall(self, cmd):
+        # TODO rc 函数调用返回值
 
         try:
-            action = Action(nodeid, None, "call", payload)
-            self.sendAction(action)
+            reply = cmd.reply()
+            # TODO 调用实际方法
+            return reply
         except:
-            logging.warn("callNode error")
+            logging.warn("Processing method call error.")
 
-    @route("call") # WARN 控制器id也必须>0
-    def handleMethodCall(self, action):
-        seq = action.seq # 调用序号
-        method = action.method # 方法
-        # 回包
-        actionReply = action.buildReply()
-        actionReply.seq = seq
+# class YqmiotController(YqmiotClient):
+#     """
+#     月球猫互联控制器
+#     """
+#     # 订阅广播消息
+#         topic = "yqmiot/{self.accountid}/0/#".format(self=self)
+#         self.subscribe(topic)
 
-        try:
-            self.sendAction(actionReply)
-        except:
-            logging.warn("handleMethodCall error")
-
-class YqmiotController(YqmiotClient):
-    """
-    月球猫互联控制器
-    """
-    # 订阅广播消息
-        topic = "yqmiot/{self.accountid}/0/#".format(self=self)
-        self.subscribe(topic)
-
-class YqmiotRaspberryPi(YqmiotClient):
-    """
-    树莓派
-    """
+# class YqmiotRaspberryPi(YqmiotClient):
+#     """
+#     树莓派
+#     """
 
 
 
 def main(argv=None):
     try:
-
+        client = YqmiotClient(("test.mosquitto.org", 1883), 1, 27888)
+        client.start()
+        while True:
+            time.sleep(1)
+            client.reportEvent(YQMIOT_EVENT_TEST)
+            client.reportProperty({"test": "test"})
+        client.stop()
         return 0
     except:
+        raise
         return -1
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
-    # try:
-    #     accountid = 0
-    #     nodeid = 0
-
-    #     opts, args = getopt.getopt(sys.argv[1:], "a:n:", ["accountid=", "nodeid="])
-    #     for k,v in opts:
-    #         if k == "--accountid" or k == "-a":
-    #             accountid = int(v)
-    #         elif k == "--nodeid" or k == "-n":
-    #             nodeid = int(v)
-
-    #     if accountid == 0 or nodeid == 0:
-    #         print """usage:
-    # python client.py [-a accountid] [-n nodeid] [--accountid accountid] [--nodeid nodeid]"""
-    #         sys.exit(0)
-    # except:
-    #     raise
-
-    # client = YqmiotClient(("iot.eclipse.org", 1883), accountid, nodeid)
-
-    # @client.route("ping")
-    # def handlePingAction(client, action):
-    #     time.sleep(1)
-    #     logging.info("handlePingAction() ")
-    #     actionReply = Action.buildReplyAction(action, "pong")
-    #     client.sendAction(actionReply)
-
-    # @client.route("pong")
-    # def handlePongAction(client, action):
-    #     logging.info("handlePongAction() ")
-
-    # @client.route("broadcast")
-    # def handleBroadcastAction(client, action):
-    #     if action.message:
-    #         logging.info(u"handleBroadcastAction() {}".format(action.message))
-
-    # client.run()
-
