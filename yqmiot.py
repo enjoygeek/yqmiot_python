@@ -16,6 +16,9 @@ VERSION = "0.0.1"
     方法则是设备对外提供的操作接口，通过它可以对设备进行控制。比如：重启，打开照明，关机等。
 """
 
+YQMIOT_OK = 0
+YQMIOT_TIMEOUT = 1
+
 YQMIOT_BROADCAST_RECEIVER = 0 # 广播接受者id
 
 # 系统命令
@@ -45,9 +48,13 @@ logging.basicConfig(level=logging.DEBUG,
 root = logging.getLogger()
 root.setLevel(logging.WARN)
 
+def millis():
+    return int(time.time() * 1000)
+
 class Command(object):
     """Mqtt Command"""
-    def __init__(self, name, receiver=None, sender=None, payload=None):
+    def __init__(self, name, receiver=None, sender=None, payload=None, action=None):
+        self.action = action
         if payload:
             self.__dict__.update(payload)
         self.name = name # Command 名称 
@@ -55,7 +62,7 @@ class Command(object):
         self.sender = sender # 发送者
         # self.seq 包追踪序列
         # self.action 方法调用的方法名，事件上报的事件名
-        # self.callid 方法调用id，发送方根据id识别应答包
+        # self.callseq 方法调用id，发送方根据id识别应答包
         # self.[other params] 其他属性
 
     def tojson(self):
@@ -112,14 +119,24 @@ class YqmiotBase(MqttClient):
         nodeid 设备id"""
     def __init__(self, address, accountid, nodeid):
         super(YqmiotBase, self).__init__(address)
-        self.accountid = accountid
-        self.nodeid = nodeid
+        self.accountid = str(accountid)
+        self.nodeid = str(nodeid)
         self.authkey = None # TODO
-        self.handlers = {}
+        self.methods = {}
 
         if self.accountid <= 0 or self.nodeid <= 0:
             raise ValueError("Invalid accountid or nodeid.")
 
+        self.callMethodLookup = {} # callseq => {callseq: callseq, callback=callback, tag=tag, time=time}
+        self.callMethodTimeout = 10*1000 # 方法调用超时时间 TODO 处理多线程问题。调用超时 
+        self.callseq = 0
+
+    def handleConnected(self):
+        super(YqmiotBase, self).handleConnected()
+        # 侦听发送给自己的消息
+        topic = "yqmiot/{self.accountid}/{self.nodeid}/#".format(self=self)
+        self.subscribe(topic)
+    
     def handleMessage(self, topic, payload):
         super(YqmiotBase, self).handleMessage(topic, payload)
 
@@ -129,10 +146,11 @@ class YqmiotBase(MqttClient):
                 and account == self.accountid \
                 and receiver == self.nodeid:
                 try:
-                    cmd = Command(command, receiver, sender, payload)
+                    cmd = Command(command, receiver, sender, json.loads(payload))
                     try:
                         self.handleCommand(cmd)
-                    except:
+                    except Exception, e:
+                        print e
                         logging.error("Failed to handle command. {}".format(topic))
                 except:
                     logging.error("Unpack failure. {}".format(topic))
@@ -141,24 +159,37 @@ class YqmiotBase(MqttClient):
         except:
             logging.error("Invalid topic. {}".format(topic))
 
-    def handleConnected(self):
-        super(YqmiotBase, self).handleConnected()
-        # 侦听发送给自己的消息
-        topic = "yqmiot/{self.accountid}/{self.nodeid}/#".format(self=self)
-        self.subscribe(topic)
-
     def handleCommand(self, cmd):
         if cmd:
-            handler = self.handlers.get(cmd.name)
-            if handler:
-                try:
-                    cmd = handler(self, cmd)
-                    if isinstance(cmd, Command):
-                        self.sendCommand(cmd) # 再来一发
-                except:
-                    logging.error("Error in processing handler.")
+            if cmd.name == YQMIOT_COMMAND_CALL:
+                if cmd.action == YQMIOT_METHOD_PING:
+                    self.sendCommand(cmd.reply())
+                else:
+                    action = cmd.action
+                    method = self.methods.get(action)
+                    if method:
+                        try:
+                            ret = method(self, cmd)
+                            if not isinstance(ret, dict):
+                                ret = None
+                            self.sendCommand(cmd.reply(ret)) # 再来一发
+                        except:
+                            logging.error("Error in processing method.")
+                    else:
+                        logging.warn("Could not find method.")
+            elif cmd.name == YQMIOT_COMMAND_ACK: # 目前只处理方法调用
+                callseq = getattr(cmd, "callseq")
+                if callseq in self.callMethodLookup:
+                    lookup = self.callMethodLookup[callseq]
+                    del self.callMethodLookup[callseq]
+                    if lookup["callback"]:
+                        t = millis() - lookup["time"]
+                        cmd._time = t
+                        lookup["callback"](self, YQMIOT_OK if t < self.callMethodTimeout else YQMIOT_TIMEOUT, cmd)
+                else:
+                    logging.error("Discard unknown source command.")
             else:
-                logging.warn("Could not find handler.")
+                logging.error("Command not supported.")
         else:
             logging.error("Invalid cmd.")
     
@@ -180,9 +211,24 @@ class YqmiotBase(MqttClient):
         else:
             logging.error("Invalid cmd.")
 
+    def callMethod(self, receiver, action, params=None, callback=None):
+        if receiver and receiver != YQMIOT_BROADCAST_RECEIVER and action:
+            try:
+                cmd = Command(YQMIOT_COMMAND_CALL, receiver, action=action, payload=params)
+                cmd.callseq = self.callseq = (self.callseq + 1)
+                self.callMethodLookup[cmd.callseq] = {"callseq": cmd.callseq, "callback": callback, "time": millis()}
+                self.sendCommand(cmd)
+            except:
+                logging.error("Error calling remote action.")
+        else:
+            logging.error("Remote action parameter is incorrect.")
+
+    def callMethodPing(self, receiver, callback=None):
+        self.callMethod(receiver, YQMIOT_METHOD_PING, callback=callback)
+
     def addHandler(self, name, handler):
-        if not self.handlers.has_key(name):
-            self.handlers[name] = handler
+        if not self.methods.has_key(name):
+            self.methods[name] = handler
         else:
             logging.warn("The corresponding processor already exists.")
 
@@ -199,22 +245,14 @@ class YqmiotClient(YqmiotBase):
     属性变更上报
     事件上报
     处理方法调用，并回包"""
-    def __init__(self, address, accountid, nodeid):
-        super(YqmiotClient, self).__init__(address, accountid, nodeid)
-        self.callseq = 0
-        self.addHandler(YQMIOT_COMMAND_CALL, self.handleRemoteCall)
 
     def handleConnected(self):
         super(YqmiotClient, self).handleConnected()
         logging.info("Connect server successfully.")
+
         # 上线通知
         self.reportEvent(YQMIOT_EVENT_ONLINE)
-
         # TODO 推送下线遗言
-
-    def handleCommand(self, cmd):
-        if 
-        super(YqmiotClient, self).handleCommand(cmd)
 
     def reportProperty(self, properties):
         """属性上报
@@ -232,35 +270,14 @@ class YqmiotClient(YqmiotBase):
         """事件上报
             action 事件名
             params 参数"""
-        try:
-            cmd = Command(YQMIOT_COMMAND_EVENT)
-            cmd.action = action
-            if isinstance(params, dict):
-                cmd.__dict__.update(params)
-            self.sendCommand(cmd)
-        except:
-            logging.error("An error occurred while reporting the event.")
-
-    def callRemote(self, receiver, action, params = None):
-        if receiver and receiver != YQMIOT_BROADCAST_RECEIVER and action:
+        if action:
             try:
-                cmd = Command(YQMIOT_COMMAND_CALL, receiver, payload=params)
-                cmd.callseq = self.callseq = (self.callseq + 1)
+                cmd = Command(YQMIOT_COMMAND_EVENT, action=action, payload=params)
                 self.sendCommand(cmd)
             except:
-                logging.error("Error calling remote action.")
+                logging.error("An error occurred while reporting the event.")
         else:
-            logging.error("Remote action parameter is incorrect.")
-        
-    def handleRemoteCall(self, cmd):
-        # TODO rc 函数调用返回值
-
-        try:
-            reply = cmd.reply()
-            # TODO 调用实际方法
-            return reply
-        except:
-            logging.warn("Processing method call error.")
+            raise TypeError("Incorrect action type.")
 
 # class YqmiotController(YqmiotClient):
 #     """
