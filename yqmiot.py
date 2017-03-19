@@ -60,7 +60,6 @@ class Command(object):
         self.name = name # Command 名称 
         self.receiver = receiver # 接受者
         self.sender = sender # 发送者
-        # self.seq 包追踪序列
         # self.action 方法调用的方法名，事件上报的事件名
         # self.callseq 方法调用id，发送方根据id识别应答包
         # self.[other params] 其他属性
@@ -71,8 +70,8 @@ class Command(object):
     def reply(self, payload=None):
         if self.name == YQMIOT_COMMAND_CALL:
             payload = payload if isinstance(payload, dict) else {}
-            payload["callseq"] = getattr(self, "callseq")
-            return Command(YQMIOT_COMMAND_ACK, self.sender, payload=payload)
+            payload["callseq"] = getattr(self, "callseq", None)
+            return Command(YQMIOT_COMMAND_ACK, self.sender, payload=payload, action=self.action)
         else:
             raise ValueError("only YQMIOT_COMMAND_CALL support reply.")
 
@@ -112,6 +111,9 @@ class MqttClient(object):
     def stop(self):
         self.client.loop_stop()
 
+    def username_pw_set(self, username, password=None):
+        self.client.username_pw_set(username, password)
+
 
 class YqmiotBase(MqttClient):
     """月球猫互联
@@ -123,13 +125,12 @@ class YqmiotBase(MqttClient):
         self.nodeid = str(nodeid)
         self.authkey = None # TODO
         self.methods = {}
+        self.callMethodLookup = {} # callseq => {callseq: callseq, callback=callback, time=time}
+        self.callMethodTimeout = 10*1000 # 方法调用超时时间 TODO 处理多线程问题。调用超时 
+        self.callseq = 0
 
         if self.accountid <= 0 or self.nodeid <= 0:
             raise ValueError("Invalid accountid or nodeid.")
-
-        self.callMethodLookup = {} # callseq => {callseq: callseq, callback=callback, tag=tag, time=time}
-        self.callMethodTimeout = 10*1000 # 方法调用超时时间 TODO 处理多线程问题。调用超时 
-        self.callseq = 0
 
     def handleConnected(self):
         super(YqmiotBase, self).handleConnected()
@@ -149,8 +150,7 @@ class YqmiotBase(MqttClient):
                     cmd = Command(command, receiver, sender, json.loads(payload))
                     try:
                         self.handleCommand(cmd)
-                    except Exception, e:
-                        print e
+                    except:
                         logging.error("Failed to handle command. {}".format(topic))
                 except:
                     logging.error("Unpack failure. {}".format(topic))
@@ -172,13 +172,14 @@ class YqmiotBase(MqttClient):
                             ret = method(self, cmd)
                             if not isinstance(ret, dict):
                                 ret = None
+                            cmd.reply(ret)
                             self.sendCommand(cmd.reply(ret)) # 再来一发
                         except:
                             logging.error("Error in processing method.")
                     else:
                         logging.warn("Could not find method.")
             elif cmd.name == YQMIOT_COMMAND_ACK: # 目前只处理方法调用
-                callseq = getattr(cmd, "callseq")
+                callseq = getattr(cmd, "callseq", None)
                 if callseq in self.callMethodLookup:
                     lookup = self.callMethodLookup[callseq]
                     del self.callMethodLookup[callseq]
