@@ -121,6 +121,9 @@ class MqttClient(object):
     def username_pw_set(self, username, password=None):
         self.client.username_pw_set(username, password)
 
+    def will_set(self, topic, payload=None, qos=0, retain=False):
+        self.client.will_set(topic, payload, qos, retain)
+
 
 class YqmiotBase(MqttClient):
     """月球猫互联通讯基类"""
@@ -260,6 +263,15 @@ class YqmiotClient(YqmiotBase):
     属性变更上报
     事件上报
     处理方法调用，并回包"""
+
+    def start(self):
+        # 离线通知
+        topic = "yqmiot/{}/{}/{}/{}".format(self.accountid, YQMIOT_BROADCAST_RECEIVER, self.nodeid, YQMIOT_COMMAND_EVENT)
+        payload = {"action": YQMIOT_EVENT_OFFLINE}
+        self.will_set(topic, json.dumps(payload))
+
+        super(YqmiotClient, self).start()
+    
 
     def handleConnected(self):
         super(YqmiotClient, self).handleConnected()
