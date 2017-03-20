@@ -157,11 +157,11 @@ class YqmiotBase(MqttClient):
             logging.error("Invalid topic. {}".format(topic))
             return
 
-        if prefix != "yqmiot" \
-            or account != self.accountid \
-            or receiver != self.nodeid: # TODO 处理广播
-            logging.error("It's not my topic. {}".format(topic))
-            return
+        # if prefix != "yqmiot" \
+        #     or account != self.accountid \
+        #     or receiver != self.nodeid: # TODO 处理广播
+        #     logging.error("It's not my topic. {}".format(topic))
+        #     return
 
         try:
             payload = json.loads(payload)
@@ -175,7 +175,7 @@ class YqmiotBase(MqttClient):
             receiver = receiver, 
             sender = sender, 
             callseq = payload.get("callseq"), 
-            params = payload)
+            params = payload.get("params"))
         try:
             self.handleCommand(cmd)
         except Exception, e:
@@ -302,34 +302,35 @@ class YqmiotClient(YqmiotBase):
         else:
             raise TypeError("Incorrect action type.")
 
-# class YqmiotController(YqmiotClient):
-#     """
-#     月球猫互联控制器
-#     """
-#     # 订阅广播消息
-#         topic = "yqmiot/{self.accountid}/0/#".format(self=self)
-#         self.subscribe(topic)
+class YqmiotController(YqmiotBase):
+    """
+    月球猫互联控制器
+    """
+    # 订阅广播消息
+    def handleConnected(self):
+        super(YqmiotController, self).handleConnected()
+        logging.info("Connect server successfully.")
+
+        # 侦听设备上报
+        topic = "yqmiot/{self.accountid}/0/#".format(self=self)
+        self.subscribe(topic)
+
+    def handleCommand(self, cmd):
+        if cmd.name == YQMIOT_COMMAND_PROPERTY:
+            self.handleCommandProperty(cmd)
+        elif cmd.name == YQMIOT_COMMAND_EVENT:
+            self.handleCommandEvent(cmd)
+        else:
+            super(YqmiotController, self).handleCommand(cmd)
+
+    def handleCommandProperty(self, cmd):
+        print "设备 {} 上报属性：{}".format(cmd.sender, cmd.params)
+
+    def handleCommandEvent(self, cmd):
+        print "设备 {} 上报事件：{}".format(cmd.sender, cmd.params)
 
 # class YqmiotRaspberryPi(YqmiotClient):
 #     """
 #     树莓派
 #     """
 
-
-
-def main(argv=None):
-    try:
-        client = YqmiotClient(("iot.eclipse.org", 1883), 1, 27888)
-        client.start()
-        while True:
-            time.sleep(1)
-            client.reportEvent(YQMIOT_EVENT_TEST)
-            client.reportProperty({"test": "test"})
-        client.stop()
-        return 0
-    except:
-        raise
-        return -1
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
