@@ -7,7 +7,7 @@ import json
 
 from paho.mqtt.client import Client as Mqtt
 
-VERSION = "0.0.1"
+VERSION = "1.0.1"
 
 """
     每个设备都拥有三类特性：属性，事件，方法。
@@ -178,8 +178,7 @@ class YqmiotBase(MqttClient):
             params = payload.get("params"))
         try:
             self.handleCommand(cmd)
-        except Exception, e:
-            print e
+        except:
             logging.error("Error processing command. {}".format(topic))
             return
 
@@ -327,10 +326,44 @@ class YqmiotController(YqmiotBase):
         print "设备 {} 上报属性：{}".format(cmd.sender, cmd.params)
 
     def handleCommandEvent(self, cmd):
-        print "设备 {} 上报事件：{}".format(cmd.sender, cmd.params)
+        print "设备 {} 上报事件：{} 参数：{}".format(cmd.sender, cmd.action, cmd.params)
 
 # class YqmiotRaspberryPi(YqmiotClient):
 #     """
 #     树莓派
 #     """
 
+def usage():
+    print """useage:
+    python yqmiot.py -a <accountid> -n <nodeid>"""
+
+class MyClient(YqmiotClient):
+    def handleCommandCall(self, cmd):
+        if cmd.action == YQMIOT_METHOD_TEST:
+            logging.info("有人调戏我")
+            self.sendCommand(cmd.reply())
+        else:
+            super(Client, self).handleCommandCall(cmd)
+
+if __name__ == "__main__":
+    accountid = 1
+    nodeid = None
+
+    opts, args = getopt.getopt(sys.argv[1:], "a:n:")
+    for k,v in opts:
+        if k == "-a":
+            pass
+            # accountid = int(v)
+        elif k == "-n":
+            nodeid = int(v)
+
+    if nodeid == None:
+        usage()
+        sys.exit(0)
+
+    client = MyClient(("iot.eclipse.org", 1883), accountid, nodeid)
+    client.start()
+    while True:
+        time.sleep(3)
+        logging.info("上报时间")
+        client.reportProperty({"timestamp": time.time()})

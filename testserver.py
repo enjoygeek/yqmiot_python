@@ -15,6 +15,12 @@ class Server(YqmiotController):
         else:
             super(Server, self).handleCommandAck(cmd)
 
+    def handleCommandEvent(self, cmd):
+        if cmd.action == yqmiot.YQMIOT_EVENT_ONLINE:
+            client.callMethod(cmd.sender, yqmiot.YQMIOT_METHOD_TEST, {"heihei": time.time()})
+        else:
+            super(Server, self).handleCommandEvent(cmd)
+
 client = Server(("iot.eclipse.org", 1883), 1, 4000)
 client.start()
 while True:
