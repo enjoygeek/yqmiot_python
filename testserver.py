@@ -21,9 +21,9 @@ class Server(YqmiotController):
         else:
             super(Server, self).handleCommandEvent(cmd)
 
-client = Server(("iot.eclipse.org", 1883), 1, 4000)
+client = Server(("yqmiot.com", 2883), 1, 4000)
 client.start()
 while True:
     time.sleep(1)
-    client.callMethodPing(3000)
-    client.callMethod(3000, yqmiot.YQMIOT_METHOD_TEST, {"heihei": time.time()})
+    # client.callMethodPing(3000)
+    # client.callMethod(3000, yqmiot.YQMIOT_METHOD_TEST, {"heihei": time.time()})
